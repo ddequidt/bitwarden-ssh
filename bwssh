@@ -150,6 +150,7 @@ unlock_vault() {
 }
 
 # Get credentials from Bitwarden with automatic retry on session expiration
+# When searching by name, only matches exact title (case-sensitive)
 get_bw_item() {
 	local object_id="$1"
 	local secret
@@ -157,10 +158,23 @@ get_bw_item() {
 	local max_retries=1
 	
 	while [[ ${retry_count} -le ${max_retries} ]]; do
-		secret=$(bw get item "${object_id}" 2>&1)
+		# Check if object_id looks like a UUID (36 characters with hyphens)
+		if [[ ${#object_id} -eq 36 && "${object_id}" =~ ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$ ]]; then
+			# It's a UUID, use direct lookup
+			secret=$(bw get item "${object_id}" 2>&1)
+		else
+			# It's a name, search for exact title match
+			secret=$(bw list items --search "${object_id}" 2>&1 | jq "[.[] | select(.name == \"${object_id}\")] | .[0]")
+			
+			# Check if jq found a match
+			if [[ "${secret}" == "null" || -z "${secret}" ]]; then
+				secret="Error: No item found with exact title match: ${object_id}"
+			fi
+		fi
+		
 		local exit_code=$?
 		
-		if [[ ${exit_code} -eq 0 ]]; then
+		if [[ ${exit_code} -eq 0 && "${secret}" != "null" && ! "${secret}" =~ ^Error ]]; then
 			echo "${secret}"
 			return 0
 		fi

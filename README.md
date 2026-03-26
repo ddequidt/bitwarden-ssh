@@ -68,6 +68,32 @@ Store SSH credentials in Bitwarden with the following fields:
   - `proxy_user` - Proxy username
   - `proxy_otp` - Proxy OTP (if required)
 
+### SSH Config Setup
+
+You can configure SSH hosts to use Bitwarden credentials by adding the `_bwid` custom option to your `~/.ssh/config`:
+
+```ssh
+Host myserver
+    HostName example.com
+    User myusername
+    _bwid myserver
+```
+
+The `_bwid` value should match the **Title** of the credential item in your Bitwarden vault exactly. The script will only use credentials for exact title matches. The script will automatically look up and use the credentials associated with that vault item.
+
+**Optional:** You can also use the Bitwarden item's UUID instead of the title:
+
+```ssh
+Host myserver
+    HostName example.com
+    _bwid a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```
+
+To find the item's UUID, you can use:
+```bash
+bw list items --search "myserver"
+```
+
 ### Login to Bitwarden
 
 ```bash
