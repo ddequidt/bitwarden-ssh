@@ -1,0 +1,30 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Bitwarden session tokens
+bw_session
+.bw_session
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+.tmp/
+
+# Shell history
+.bash_history
+.zsh_history
+
+# OS files
+Thumbs.db
+.AppleDouble
+.LSOverride

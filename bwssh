@@ -1,0 +1,430 @@
+#!/bin/bash
+#
+# Bitwarden SSH Auto Login
+# Automatically retrieves SSH credentials from Bitwarden vault
+# Supports ProxyJump with multiple authentication steps
+#
+
+set -o pipefail
+
+# Constants
+readonly SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+readonly SSH_CONFIG_FILE="${HOME}/.ssh/config"
+readonly BW_SESSION_KEY="bw_session"
+
+# Global variables
+# Always prepend ssh command - this is the only action
+cmd="ssh $*"
+LAST_SESSION_CHECK=0
+SESSION_CHECK_INTERVAL=300  # 5 minutes in seconds
+
+# Check if kernel keyring is available (required)
+if ! command -v keyctl &>/dev/null; then
+	echo >&2 "Error: keyctl (kernel keyring) not found"
+	echo >&2 "Install via: apt install keyutils"
+	exit 1
+fi
+
+# Check required dependencies
+check_dependencies() {
+	local missing_deps=()
+	
+	if ! command -v bw &>/dev/null; then
+		missing_deps+=("bw (Bitwarden CLI - https://github.com/bitwarden/cli)")
+	fi
+	if ! command -v expect &>/dev/null; then
+		missing_deps+=("expect (apt install expect)")
+	fi
+	if ! command -v jq &>/dev/null; then
+		missing_deps+=("jq (apt install jq)")
+	fi
+	
+	if [[ ${#missing_deps[@]} -gt 0 ]]; then
+		echo >&2 "Error: Missing required dependencies:"
+		for dep in "${missing_deps[@]}"; do
+			echo >&2 "  - ${dep}"
+		done
+		return 1
+	fi
+	return 0
+}
+
+if ! check_dependencies; then
+	exit 1
+fi
+
+# Load BW_SESSION from kernel keyring
+load_session() {
+	if [[ -n "${BW_SESSION}" ]]; then
+		return 0
+	fi
+	
+	# Load from kernel keyring
+	local key_id
+	key_id=$(keyctl search @u user "${BW_SESSION_KEY}" 2>/dev/null)
+	if [[ -n "${key_id}" ]]; then
+		BW_SESSION=$(keyctl pipe "${key_id}" 2>/dev/null)
+		if [[ -n "${BW_SESSION}" ]]; then
+			export BW_SESSION
+			return 0
+		fi
+	fi
+	return 1
+}
+
+# Save BW_SESSION to kernel keyring
+save_session() {
+	local session="$1"
+	
+	# Remove old key if exists
+	local old_key_id
+	old_key_id=$(keyctl search @u user "${BW_SESSION_KEY}" 2>/dev/null)
+	if [[ -n "${old_key_id}" ]]; then
+		keyctl unlink "${old_key_id}" @u &>/dev/null
+	fi
+	
+	# Add new key to user keyring
+	echo -n "${session}" | keyctl padd user "${BW_SESSION_KEY}" @u &>/dev/null
+	
+	# Set timeout (expires after 1 hour of inactivity)
+	local key_id
+	key_id=$(keyctl search @u user "${BW_SESSION_KEY}" 2>/dev/null)
+	if [[ -n "${key_id}" ]]; then
+		keyctl timeout "${key_id}" 3600 &>/dev/null
+	fi
+}
+
+# Clear session from kernel keyring
+clear_session() {
+	unset BW_SESSION
+	
+	# Remove from kernel keyring
+	local key_id
+	key_id=$(keyctl search @u user "${BW_SESSION_KEY}" 2>/dev/null)
+	if [[ -n "${key_id}" ]]; then
+		keyctl unlink "${key_id}" @u &>/dev/null
+	fi
+}
+
+# Validate if current session is still valid (cached for performance)
+validate_session() {
+	[[ -z "${BW_SESSION}" ]] && return 1
+	
+	local now
+	now=$(date +%s)
+	
+	# Skip validation if checked recently (within 5 minutes)
+	if ((now - LAST_SESSION_CHECK < SESSION_CHECK_INTERVAL)); then
+		return 0
+	fi
+	
+	local status
+	status=$(bw status 2>&1) || return 1
+	
+	if grep -qi 'unlocked' <<< "${status}"; then
+		LAST_SESSION_CHECK=${now}
+		return 0
+	fi
+	return 1
+}
+
+# Unlock Bitwarden vault and save session
+unlock_vault() {
+	echo "Unlocking Bitwarden vault..."
+	echo "Please enter your master password:"
+	
+	local session_id
+	# Don't redirect stderr so user can see prompts
+	session_id=$(bw unlock --raw)
+	local exit_code=$?
+	
+	if [[ ${exit_code} -ne 0 || -z "${session_id}" ]]; then
+		echo >&2 "Error: Unlock failed"
+		return 1
+	fi
+	
+	export BW_SESSION="${session_id}"
+	save_session "${session_id}"
+	echo "✓ Vault unlocked successfully"
+	return 0
+}
+
+# Get credentials from Bitwarden with automatic retry on session expiration
+get_bw_item() {
+	local object_id="$1"
+	local secret
+	local retry_count=0
+	local max_retries=1
+	
+	while [[ ${retry_count} -le ${max_retries} ]]; do
+		secret=$(bw get item "${object_id}" 2>&1)
+		local exit_code=$?
+		
+		if [[ ${exit_code} -eq 0 ]]; then
+			echo "${secret}"
+			return 0
+		fi
+		
+		# Check if it's a session-related error
+		if grep -qiE 'session|unlock|locked|not logged in' <<< "${secret}"; then
+			if [[ ${retry_count} -lt ${max_retries} ]]; then
+				echo "Session expired, refreshing..."
+				clear_session
+				
+				if unlock_vault; then
+					((retry_count++))
+					continue
+				else
+					return 1
+				fi
+			fi
+		fi
+		
+		# Non-session error or max retries reached
+		echo >&2 "Error: Failed to retrieve item from Bitwarden"
+		echo >&2 "${secret}"
+		return 1
+	done
+	
+	return 1
+}
+
+# Retrieve credentials (password and optional TOTP) from Bitwarden
+# Caches items to avoid duplicate bw calls
+declare -A BW_ITEM_CACHE
+
+get_credentials() {
+	local object_id="$1"
+	local -n password_ref="$2"
+	local -n totp_ref="$3"
+	
+	local secret
+	# Check cache first to avoid duplicate bw calls
+	if [[ -n "${BW_ITEM_CACHE[${object_id}]}" ]]; then
+		secret="${BW_ITEM_CACHE[${object_id}]}"
+	else
+		secret=$(get_bw_item "${object_id}") || return 1
+		BW_ITEM_CACHE[${object_id}]="${secret}"
+	fi
+	
+	# Extract password and TOTP in single jq call
+	local password totp_secret
+	password=$(echo "${secret}" | jq -r '.login.password')
+	totp_secret=$(echo "${secret}" | jq -r '.login.totp // ""')
+	
+	if [[ -z "${password}" ]]; then
+		echo >&2 "Error: No password found in Bitwarden item ${object_id}"
+		return 1
+	fi
+	
+	password_ref="${password}"
+	
+	# Generate TOTP silently if available (skip oathtool check overhead)
+	if [[ -n "${totp_secret}" ]]; then
+		totp_ref=$(oathtool -b --totp "${totp_secret}" 2>/dev/null) || totp_ref=""
+	else
+		totp_ref=""
+	fi
+	
+	return 0
+}
+
+# Parse SSH config to get host configuration
+# Returns: _bwid value and ProxyJump host (if any)
+parse_ssh_host_config() {
+	local target_host="$1"
+	local -n bwid_ref="$2"
+	local -n proxyjump_ref="$3"
+	
+	if [[ ! -f "${SSH_CONFIG_FILE}" ]]; then
+		return 1
+	fi
+	
+	local in_host_block=0
+	local current_host=""
+	bwid_ref=""
+	proxyjump_ref=""
+	
+	while IFS= read -r line; do
+		# Remove leading/trailing whitespace
+		line="${line#"${line%%[![:space:]]*}"}"
+		line="${line%"${line##*[![:space:]]}"}"
+		
+		# Check for Host directive
+		if [[ "${line}" =~ ^Host[[:space:]]+(.+)$ ]]; then
+			current_host="${BASH_REMATCH[1]}"
+			
+			# Check if this host matches our target
+			if [[ "${target_host}" == "${current_host}" ]] || [[ "${target_host}" =~ ${current_host} ]]; then
+				in_host_block=1
+			else
+				# If we were in a matching block and now found a new Host, we're done
+				if [[ ${in_host_block} -eq 1 ]]; then
+					break
+				fi
+				in_host_block=0
+			fi
+			continue
+		fi
+		
+		# Skip if not in target host block
+		[[ ${in_host_block} -eq 0 ]] && continue
+		
+		# Parse _bwid (custom key)
+		if [[ "${line}" =~ ^_bwid[[:space:]]+(.+)$ ]] || [[ "${line}" =~ ^#[[:space:]]*_bwid[[:space:]]*[:=][[:space:]]*(.+)$ ]]; then
+			bwid_ref="${BASH_REMATCH[1]}"
+			bwid_ref="${bwid_ref#"${bwid_ref%%[![:space:]]*}"}"  # trim leading spaces
+			bwid_ref="${bwid_ref%"${bwid_ref##*[![:space:]]}"}"  # trim trailing spaces
+		fi
+		
+		# Parse ProxyJump
+		if [[ "${line}" =~ ^ProxyJump[[:space:]]+(.+)$ ]]; then
+			proxyjump_ref="${BASH_REMATCH[1]}"
+			proxyjump_ref="${proxyjump_ref#"${proxyjump_ref%%[![:space:]]*}"}"
+			proxyjump_ref="${proxyjump_ref%"${proxyjump_ref##*[![:space:]]}"}"
+		fi
+		
+	done < "${SSH_CONFIG_FILE}"
+	
+	[[ -n "${bwid_ref}" ]] && return 0
+	return 1
+}
+
+# Check if SSH ControlMaster session already exists for target host
+has_ssh_control_master() {
+	local hostname="$1"
+	
+	# Try to check if a control master connection exists
+	# This uses ssh -O check which returns 0 if master is running
+	ssh -O check -q "${hostname}" 2>/dev/null
+	return $?
+}
+
+# Extract hostname from SSH command
+extract_hostname_from_command() {
+	local ssh_cmd="$1"
+	local hostname=""
+	
+	# Parse SSH command to extract hostname
+	# Handles: ssh user@host, ssh host, ssh -p 22 host, etc.
+	if [[ "${ssh_cmd}" =~ ssh[[:space:]]+.*[[:space:]]([^[:space:]@]+@)?([^[:space:]@]+)$ ]]; then
+		hostname="${BASH_REMATCH[2]}"
+	elif [[ "${ssh_cmd}" =~ ssh[[:space:]]+([^[:space:]@]+@)?([^[:space:]@]+) ]]; then
+		hostname="${BASH_REMATCH[2]}"
+	fi
+	
+	echo "${hostname}"
+}
+
+# Main function to handle SSH with Bitwarden credentials
+# Supports ProxyJump with multiple authentication steps
+do_bwssh() {
+	local target_host="$1"
+	
+	# Load existing session
+	load_session
+	
+	# Parse SSH config for target host (fast operation)
+	local target_bwid proxyjump_host
+	if ! parse_ssh_host_config "${target_host}" target_bwid proxyjump_host; then
+		echo >&2 "Error: No _bwid found in SSH config for host: ${target_host}"
+		return 1
+	fi
+	
+	# Attempt to get credentials - will trigger unlock if session invalid
+	if [[ -z "${BW_SESSION}" ]]; then
+		if ! unlock_vault; then
+			return 1
+		fi
+	fi
+	
+	# echo "Found Bitwarden ID for ${target_host}: ${target_bwid}"
+	
+	# Get credentials for target host
+	local target_password target_otp
+	if ! get_credentials "${target_bwid}" target_password target_otp; then
+		return 1
+	fi
+	
+	echo "✓ Retrieved credentials for ${target_host}"
+	
+	# Check if ProxyJump is configured
+	local proxy_password="" proxy_otp=""
+	if [[ -n "${proxyjump_host}" ]]; then
+		# echo "ProxyJump detected: ${proxyjump_host}"
+		
+		# Parse proxy host config
+		local proxy_bwid proxy_proxyjump
+		if parse_ssh_host_config "${proxyjump_host}" proxy_bwid proxy_proxyjump; then
+			# echo "Found Bitwarden ID for proxy ${proxyjump_host}: ${proxy_bwid}"
+			
+			# Get credentials for proxy host
+			if ! get_credentials "${proxy_bwid}" proxy_password proxy_otp; then
+				echo >&2 "Warning: Could not retrieve proxy credentials, will try without"
+			else
+				echo "✓ Retrieved credentials for proxy ${proxyjump_host}"
+			fi
+		else
+			echo "No _bwid found for proxy host, SSH key authentication will be used"
+		fi
+	fi
+	
+	# Execute SSH with expect script (optimized expect)
+	local expect_script="${SCRIPT_DIR}/bwssh.expect"
+	
+	if [[ ! -f "${expect_script}" ]]; then
+		echo >&2 "Error: Expect script not found: ${expect_script}"
+		return 1
+	fi
+	
+	# Call expect with appropriate parameters
+	# Format: cmd proxy_pass proxy_otp target_pass target_otp
+	expect "${expect_script}" "${cmd}" \
+		"${proxy_password}" "${proxy_otp}" \
+		"${target_password}" "${target_otp}"
+}
+
+# Main execution
+main() {
+	if [[ -z "${cmd}" ]]; then
+		echo >&2 "Usage: $0 <ssh-command>"
+		exit 1
+	fi
+	
+	# Check if SSH config exists
+	if [[ ! -f "${SSH_CONFIG_FILE}" ]]; then
+		echo >&2 "Warning: SSH config not found: ${SSH_CONFIG_FILE}"
+		echo >&2 "Running command without Bitwarden integration"
+		eval "${cmd}"
+		exit $?
+	fi
+	
+	# Extract hostname from command
+	local hostname
+	hostname=$(extract_hostname_from_command "${cmd}")
+	
+	if [[ -z "${hostname}" ]]; then
+		echo >&2 "Warning: Could not extract hostname from command"
+		echo >&2 "Running command without Bitwarden integration"
+		eval "${cmd}"
+		exit $?
+	fi
+	
+	# Check if there's already an SSH ControlMaster session for this host
+	if has_ssh_control_master "${hostname}"; then
+		echo "✓ Using existing SSH ControlMaster session for ${hostname}"
+		eval "${cmd}"
+		return $?
+	fi
+	
+	# Check if host has _bwid in SSH config
+	local bwid proxyjump
+	if parse_ssh_host_config "${hostname}" bwid proxyjump; then
+		do_bwssh "${hostname}"
+	else
+		# No _bwid found, run command normally
+		eval  "${cmd}"
+	fi
+}
+
+main "$@"

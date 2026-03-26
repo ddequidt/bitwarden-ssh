@@ -1,0 +1,129 @@
+#!/usr/bin/expect -f
+#
+# Bitwarden SSH Expect Script
+# Handles multi-hop authentication with ProxyJump scenarios
+#
+
+# Reduce timeout to 30s for faster initial response, increase after spawn
+set timeout 10
+
+# Arguments: cmd proxy_pass proxy_otp target_pass target_otp
+set cmd [lindex $argv 0]
+set proxy_pass [lindex $argv 1]
+set proxy_otp [lindex $argv 2]
+set target_pass [lindex $argv 3]
+set target_otp [lindex $argv 4]
+
+# Debug info
+#send_user "Debug: cmd=$cmd\n"
+#send_user "Debug: proxy_pass=[string length $proxy_pass] chars\n"
+#send_user "Debug: proxy_otp=[string length $proxy_otp] chars\n"
+#send_user "Debug: target_pass=[string length $target_pass] chars\n"
+#send_user "Debug: target_otp=[string length $target_otp] chars\n"
+
+# Determine authentication mode
+set has_proxy [expr {[string length $proxy_pass] > 0}]
+set has_proxy_otp [expr {[string length $proxy_otp] > 0}]
+set has_target_otp [expr {[string length $target_otp] > 0}]
+
+#send_user "Debug: has_proxy=$has_proxy, has_proxy_otp=$has_proxy_otp, has_target_otp=$has_target_otp\n"
+
+# Enable internal debugging
+#exp_internal 0
+
+# Start SSH command
+eval spawn $cmd
+
+# Increase timeout after spawn for slower connections
+set timeout 120
+
+# Track which authentication step we're on
+set auth_step 0
+
+log_user 1
+
+expect {
+    # Password prompts (matches various formats including (user@host) Password:)
+    -re ".*\[Pp\]assword:" {
+        incr auth_step
+        #send_user "\n!!! Password prompt matched, auth_step=$auth_step !!!\n"
+        
+        if {$has_proxy && $auth_step == 1} {
+            # First password prompt - proxy authentication
+            send_user "→ Authenticating to proxy...\n"
+            send -- "$proxy_pass\r"
+            exp_continue
+        } else {
+            # Second password prompt or only prompt - target authentication
+            send_user "→ Authenticating to target host...\n"
+            send -- "$target_pass\r"
+            exp_continue
+        }
+    }
+    
+    # OTP/2FA prompts
+    -re "(?i)(verification code|token|otp|authenticat(ion|or) code|2fa|pin).*:" {
+        if {$has_proxy && $has_proxy_otp && $auth_step == 1} {
+            # Proxy OTP
+            send_user "→ Sending proxy verification code...\n"
+            send "$proxy_otp\r"
+            exp_continue
+        } elseif {$has_target_otp} {
+            # Target OTP
+            send_user "→ Sending target verification code...\n"
+            send "$target_otp\r"
+            exp_continue
+        } else {
+            send_user "Warning: OTP requested but not available\n"
+            exp_continue
+        }
+    }
+    
+    # Common SSH prompts
+    -re "(?i)are you sure you want to continue connecting" {
+        send "yes\r"
+        exp_continue
+    }
+    
+    # Permission denied - authentication failed
+    -re "(?i)permission denied" {
+        send_user "\n✗ Authentication failed\n"
+        exit 1
+    }
+    
+    # Connection errors
+    -re "(?i)(connection refused|connection closed|connection reset|no route to host)" {
+        send_user "\n✗ Connection error\n"
+        exit 1
+    }
+    
+    # Too many authentication failures
+    -re "(?i)too many authentication failures" {
+        send_user "\n✗ Too many authentication failures\n"
+        exit 1
+    }
+    
+    # Successful connection - shell prompt or command output
+    -re "(\\\$|#|>|%|bash-.*\\\$|~.*\\\$)" {
+        send_user "\n✓ Connected successfully\n"
+        send "\r"
+        # Hand over control to user
+        interact
+    }
+    
+    # EOF - connection ended
+    eof {
+        send_user "\n✓ Connection closed\n"
+        exit 0
+    }
+    
+    # Timeout
+    timeout {
+        send_user "\n✗ Timeout waiting for response\n"
+        exit 1
+    }
+}
+
+# Should not reach here, but handle gracefully
+send_user "\n✓ Session ended\n"
+exit 0
