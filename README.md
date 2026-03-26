@@ -136,6 +136,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 Davy Dequidt
 
+## Credits
+
+This project was inspired by [bitwarden-ssh-auto-login](https://github.com/lessmind/bitwarden-ssh-auto-login) by lessmind.
+
 ## Disclaimer
 
 This tool handles credentials. Use responsibly and ensure Bitwarden master password security. The authors are not responsible for credential misuse or unauthorized access.
