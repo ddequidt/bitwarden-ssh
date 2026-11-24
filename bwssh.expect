@@ -8,21 +8,21 @@
 set timeout 10
 
 # Argument: cmd
-# Secrets come from the environment so they do not show in ps.
-# They are removed before spawn so ssh does not inherit them.
+# Secrets come on fd 3, one per line: proxy_pass proxy_otp target_pass target_otp.
+# A pipe keeps them out of ps and /proc/<pid>/environ.
+# The fd is closed before spawn so ssh does not inherit it.
 set cmd [lindex $argv 0]
-proc take_env {name} {
-    set value ""
-    if {[info exists ::env($name)]} {
-        set value $::env($name)
-        unset ::env($name)
-    }
-    return $value
+set proxy_pass ""
+set proxy_otp ""
+set target_pass ""
+set target_otp ""
+if {[catch {open /dev/fd/3 r} secrets_fd] == 0} {
+    gets $secrets_fd proxy_pass
+    gets $secrets_fd proxy_otp
+    gets $secrets_fd target_pass
+    gets $secrets_fd target_otp
+    close $secrets_fd
 }
-set proxy_pass [take_env BWSSH_PROXY_PASS]
-set proxy_otp [take_env BWSSH_PROXY_OTP]
-set target_pass [take_env BWSSH_TARGET_PASS]
-set target_otp [take_env BWSSH_TARGET_OTP]
 
 # Debug info
 #send_user "Debug: cmd=$cmd\n"

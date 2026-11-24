@@ -391,10 +391,11 @@ do_bwssh() {
 		return 1
 	fi
 	
-	# Secrets go through the environment, not argv, so they do not show in ps.
-	BWSSH_PROXY_PASS="${proxy_password}" BWSSH_PROXY_OTP="${proxy_otp}" \
-	BWSSH_TARGET_PASS="${target_password}" BWSSH_TARGET_OTP="${target_otp}" \
-		expect "${expect_script}" "${cmd}"
+	# Secrets go through a pipe on fd 3, one per line.
+	# They do not show in ps or in /proc/<pid>/environ.
+	expect "${expect_script}" "${cmd}" 3< <(printf '%s\n' \
+		"${proxy_password}" "${proxy_otp}" \
+		"${target_password}" "${target_otp}")
 }
 
 # Main execution
