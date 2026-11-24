@@ -391,11 +391,10 @@ do_bwssh() {
 		return 1
 	fi
 	
-	# Call expect with appropriate parameters
-	# Format: cmd proxy_pass proxy_otp target_pass target_otp
-	expect "${expect_script}" "${cmd}" \
-		"${proxy_password}" "${proxy_otp}" \
-		"${target_password}" "${target_otp}"
+	# Secrets go through the environment, not argv, so they do not show in ps.
+	BWSSH_PROXY_PASS="${proxy_password}" BWSSH_PROXY_OTP="${proxy_otp}" \
+	BWSSH_TARGET_PASS="${target_password}" BWSSH_TARGET_OTP="${target_otp}" \
+		expect "${expect_script}" "${cmd}"
 }
 
 # Main execution

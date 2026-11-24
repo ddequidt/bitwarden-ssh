@@ -7,12 +7,22 @@
 # Reduce timeout to 30s for faster initial response, increase after spawn
 set timeout 10
 
-# Arguments: cmd proxy_pass proxy_otp target_pass target_otp
+# Argument: cmd
+# Secrets come from the environment so they do not show in ps.
+# They are removed before spawn so ssh does not inherit them.
 set cmd [lindex $argv 0]
-set proxy_pass [lindex $argv 1]
-set proxy_otp [lindex $argv 2]
-set target_pass [lindex $argv 3]
-set target_otp [lindex $argv 4]
+proc take_env {name} {
+    set value ""
+    if {[info exists ::env($name)]} {
+        set value $::env($name)
+        unset ::env($name)
+    }
+    return $value
+}
+set proxy_pass [take_env BWSSH_PROXY_PASS]
+set proxy_otp [take_env BWSSH_PROXY_OTP]
+set target_pass [take_env BWSSH_TARGET_PASS]
+set target_otp [take_env BWSSH_TARGET_OTP]
 
 # Debug info
 #send_user "Debug: cmd=$cmd\n"
