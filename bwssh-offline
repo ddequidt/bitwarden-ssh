@@ -1,0 +1,164 @@
+#!/usr/bin/python3 -I
+"""Read one item from the local Bitwarden CLI vault copy, without the server.
+
+Usage: bwssh-offline <item name or id>   (master password on stdin, one line)
+
+Prints the item as JSON, in the same shape as `bw get item`.
+Only the fields bwssh needs are decrypted: name, login.username, login.password, login.totp.
+
+Crypto steps (Bitwarden account format, PBKDF2 KDF only):
+- master key = PBKDF2-SHA256(password, salt, iterations)
+- stretched key = HKDF-Expand(master key, "enc") + HKDF-Expand(master key, "mac")
+- user key = decrypt(masterKeyEncryptedUserKey, stretched key)
+- org key = RSA-OAEP-SHA1 decrypt with the user private key
+- item key = decrypt(cipher.key) when the item has its own key
+"""
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sys
+
+from cryptography.hazmat.primitives import hashes, padding, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as rsa_padding
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+
+DATA_FILE = os.path.join(
+    os.environ.get("BITWARDENCLI_APPDATA_DIR")
+    or os.path.expanduser("~/.config/Bitwarden CLI"),
+    "data.json",
+)
+
+
+class DecryptError(Exception):
+    pass
+
+
+def hkdf_expand(key, info):
+    return HKDFExpand(algorithm=hashes.SHA256(), length=32, info=info).derive(key)
+
+
+def decrypt_sym(enc_string, key):
+    """Decrypt a type 2 string ("2.iv|data|mac"). The key is 64 bytes: enc + mac."""
+    enc_type, _, body = enc_string.partition(".")
+    if enc_type != "2":
+        raise DecryptError(f"unsupported encryption type {enc_type}")
+    iv, data, mac = (base64.b64decode(p) for p in body.split("|"))
+    enc_key, mac_key = key[:32], key[32:]
+    expected = hmac.new(mac_key, iv + data, hashlib.sha256).digest()
+    if not hmac.compare_digest(mac, expected):
+        raise DecryptError("MAC check failed")
+    decryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(data) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+def decrypt_rsa(enc_string, private_key):
+    """Decrypt a type 4 string (RSA-OAEP with SHA-1)."""
+    enc_type, _, body = enc_string.partition(".")
+    if enc_type != "4":
+        raise DecryptError(f"unsupported encryption type {enc_type}")
+    data = base64.b64decode(body.split("|")[0])
+    oaep = rsa_padding.OAEP(
+        mgf=rsa_padding.MGF1(hashes.SHA1()), algorithm=hashes.SHA1(), label=None
+    )
+    return private_key.decrypt(data, oaep)
+
+
+def user_value(data, user_id, name):
+    return data.get(f"user_{user_id}_{name}")
+
+
+def unlock(data, password):
+    """Return (user id, user key) or raise DecryptError on a wrong password."""
+    user_id = data["global_account_activeAccountId"]
+    kdf = user_value(data, user_id, "kdfConfig_kdfConfig") or {}
+    if kdf.get("kdfType", 0) != 0:
+        raise DecryptError("only PBKDF2 accounts are supported offline")
+    unlock_data = user_value(data, user_id, "masterPasswordUnlock_masterPasswordUnlockKey") or {}
+    salt = unlock_data.get("salt") or data["global_account_accounts"][user_id]["email"].strip().lower()
+    master_key = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), salt.encode(), kdf["iterations"]
+    )
+    stretched = hkdf_expand(master_key, b"enc") + hkdf_expand(master_key, b"mac")
+    encrypted_user_key = user_value(data, user_id, "masterPassword_masterKeyEncryptedUserKey")
+    try:
+        return user_id, decrypt_sym(encrypted_user_key, stretched)
+    except DecryptError:
+        raise DecryptError("invalid master password") from None
+
+
+def org_keys(data, user_id, user_key):
+    state = user_value(data, user_id, "crypto_accountCryptographicState") or {}
+    enc_private = (state.get("V1") or {}).get("private_key")
+    enc_orgs = user_value(data, user_id, "crypto_organizationKeys") or {}
+    if not enc_private or not enc_orgs:
+        return {}
+    private_key = serialization.load_der_private_key(
+        decrypt_sym(enc_private, user_key), password=None
+    )
+    return {org_id: decrypt_rsa(v["key"], private_key) for org_id, v in enc_orgs.items()}
+
+
+def item_key(cipher, user_key, orgs):
+    key = orgs.get(cipher["organizationId"]) if cipher.get("organizationId") else user_key
+    if key is None:
+        raise DecryptError(f"no key for organization {cipher['organizationId']}")
+    if cipher.get("key"):
+        key = decrypt_sym(cipher["key"], key)
+    return key
+
+
+def text(value, key):
+    return decrypt_sym(value, key).decode() if value else None
+
+
+def find_item(data, user_id, user_key, wanted):
+    orgs = org_keys(data, user_id, user_key)
+    ciphers = (user_value(data, user_id, "ciphers_ciphers") or {}).values()
+    for cipher in ciphers:
+        if cipher.get("deletedDate") or cipher.get("type") != 1:
+            continue
+        key = item_key(cipher, user_key, orgs)
+        name = text(cipher.get("name"), key)
+        if wanted not in (cipher["id"], name):
+            continue
+        login = cipher.get("login") or {}
+        return {
+            "id": cipher["id"],
+            "name": name,
+            "login": {
+                "username": text(login.get("username"), key),
+                "password": text(login.get("password"), key),
+                "totp": text(login.get("totp"), key),
+            },
+        }
+    return None
+
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__.strip().splitlines()[2], file=sys.stderr)
+        return 2
+    password = sys.stdin.readline().rstrip("\n")
+    try:
+        with open(DATA_FILE) as f:
+            data = json.load(f)
+        user_id, user_key = unlock(data, password)
+        item = find_item(data, user_id, user_key, sys.argv[1])
+    except (DecryptError, KeyError, ValueError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    if item is None:
+        print(f"Error: No item found with exact title match: {sys.argv[1]}", file=sys.stderr)
+        return 1
+    print(json.dumps(item))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

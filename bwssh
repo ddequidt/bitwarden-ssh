@@ -53,6 +53,41 @@ if ! check_dependencies; then
 	exit 1
 fi
 
+BW_OFFLINE=0
+BW_OFFLINE_PASSWORD=""
+
+# Return 0 when the Bitwarden server does not answer within 3 seconds.
+bw_server_unreachable() {
+	local url host port
+	url=$(bw config server 2>/dev/null)
+	host="${url#*://}"
+	host="${host%%/*}"
+	port="${host##*:}"
+	[[ "${port}" == "${host}" ]] && port=443
+	host="${host%%:*}"
+	[[ -z "${host}" ]] && return 1
+	! timeout 3 bash -c ": </dev/tcp/${host}/${port}" 2>/dev/null
+}
+
+# Switch to the local vault copy when the server is down.
+# - bw has no timeout when the server drops packets, so it hangs.
+# - bw unlock also needs the server to refresh its login token, so it cannot unlock offline.
+# - bwssh-offline decrypts the local data.json directly with the master password.
+# - Must run in the main shell, because items are read inside $(...).
+detect_bw_offline() {
+	bw_server_unreachable || return 0
+	echo "⚠ Bitwarden server unreachable, using local vault copy"
+	read -rsp "Master password: " BW_OFFLINE_PASSWORD
+	echo
+	[[ -n "${BW_OFFLINE_PASSWORD}" ]] || return 1
+	BW_OFFLINE=1
+}
+
+# Print one item from the local vault copy, in bw JSON format.
+get_bw_item_offline() {
+	"${SCRIPT_DIR}/bwssh-offline" "$1" < <(printf '%s\n' "${BW_OFFLINE_PASSWORD}")
+}
+
 # Load BW_SESSION from kernel keyring
 load_session() {
 	if [[ -n "${BW_SESSION}" ]]; then
@@ -216,6 +251,9 @@ get_credentials() {
 	# Check cache first to avoid duplicate bw calls
 	if [[ -n "${BW_ITEM_CACHE[${object_id}]}" ]]; then
 		secret="${BW_ITEM_CACHE[${object_id}]}"
+	elif [[ "${BW_OFFLINE}" == 1 ]]; then
+		secret=$(get_bw_item_offline "${object_id}") || return 1
+		BW_ITEM_CACHE[${object_id}]="${secret}"
 	else
 		secret=$(get_bw_item "${object_id}") || return 1
 		BW_ITEM_CACHE[${object_id}]="${secret}"
@@ -345,8 +383,10 @@ do_bwssh() {
 		return 1
 	fi
 	
+	detect_bw_offline || return 1
+
 	# Attempt to get credentials - will trigger unlock if session invalid
-	if [[ -z "${BW_SESSION}" ]]; then
+	if [[ "${BW_OFFLINE}" == 0 && -z "${BW_SESSION}" ]]; then
 		if ! unlock_vault; then
 			return 1
 		fi
